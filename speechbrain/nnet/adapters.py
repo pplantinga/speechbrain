@@ -12,7 +12,7 @@ from fnmatch import fnmatch
 import torch
 import torch.nn as nn
 
-from speechbrain.nnet.activations import Swish
+from speechbrain.nnet.activations import JumpReLU, Swish
 from speechbrain.utils import checkpoints
 
 MHA_WARNING = """
@@ -178,6 +178,29 @@ class AdaptedModel(nn.Module):
 
         # Normal access
         return super().__getattr__(item)
+
+    def encode(self, x):
+        """Return the storage of any adapters with the capability."""
+
+        # Enable storage for modules that support it
+        for name in self.replace_layers:
+            module = self.adapted_model.get_submodule(name)
+            if hasattr(module, "enable_storage"):
+                module.enable_storage()
+
+        # Perform forward pass to store intermediate embeddings
+        x = self.forward(x)
+
+        # Collect embeddings from all modules that support it
+        encoded_outputs = []
+        for name in self.replace_layers:
+            module = self.adapted_model.get_submodule(name)
+            if hasattr(module, "get_storage"):
+                encoded_outputs.append(module.get_storage())
+            if hasattr(module, "disable_storage"):
+                module.disable_storage()
+
+        return torch.stack(encoded_outputs)
 
 
 def is_layer_adaptable(name, module, all_linear, all_conv, target_layers):
@@ -385,3 +408,93 @@ class LoRA(nn.Module):
         x_lora = self.adapter_up_proj(self.adapter_down_proj(x)) * self.scaling
 
         return x_pretrained + x_lora
+
+
+class SparseAutoEncoder(nn.Module):
+    """Adds a sparse auto-encoder (SAE) layer after a pretrained module.
+
+    Arguments
+    ---------
+    target_module: nn.Module
+        A pretrained module for inserting the SAE layer.
+    dict_size: int
+        The number of neurons in the SAE layer, usually larger than the module output.
+    activation: class, default speechbrain.nnet.activations.JumpReLU
+        The class to use for activation, usually a ReLU-family function that creates
+        sparse outputs by zeroing some outputs. The passed class definition will be
+        called to initialize the activation function using the size of the target.
+
+    Example
+    -------
+    >>> test_input = torch.rand(10)
+    >>> module = torch.nn.Linear(10, 20)
+    >>> sae = SparseAutoEncoder(module, dict_size=100)
+    >>> sae.enable_storage()
+    >>> sae(test_input).size()
+    torch.Size([20])
+    >>> sae.sparse_loss.size()
+    torch.Size([100])
+    >>> torch.allclose(sae.encode(test_input), sae.get_activations())
+    True
+    """
+
+    def __init__(self, target_module, dict_size, activation=JumpReLU):
+        super().__init__()
+
+        # Ensure module is frozen
+        self.pretrained_module = target_module
+        for param in target_module.parameters():
+            param.requires_grad = False
+
+        # Initialize the parameters and activations of SAE
+        # TODO: handle activations that don't take `input_size`
+        weight_output_size = target_module.weight.data.shape[0]
+        self.encoder = nn.Linear(weight_output_size, dict_size)
+        self.activation = activation(input_size=dict_size)
+        self.decoder = nn.Linear(dict_size, weight_output_size)
+
+        # Initialize the machinery for caching the sparse activations and loss
+        self.sparse_loss = None
+        self.sparse_activations = None
+        self.storing_activations = False
+
+    def forward(self, x):
+        """Full forward pass, encode then decode for training purposes."""
+        if self.training:
+            # Compute and store loss during training, assuming we'll need it
+            activations, sparse_loss = self.encode(x, sparse_loss=True)
+            self.sparse_loss = sparse_loss
+        else:
+            activations = self.encode(x, sparse_loss=False)
+
+        if self.storing_activations:
+            self.sparse_activations = activations
+
+        return self.decode(activations)
+
+    def encode(self, x, sparse_loss=False):
+        """Returns the sparse activations for interpretability analysis."""
+        encoder_output = self.encoder(self.pretrained_module(x))
+
+        # TODO: Handle activations that don't return a sparse loss
+        return self.activation(encoder_output, sparse_loss=sparse_loss)
+
+    def decode(self, encoding):
+        """Returns the decoded activations for use by the next layer."""
+        return self.decoder(encoding)
+
+    def enable_storage(self):
+        """Turn on the storage of activations during the forward pass."""
+        self.storing_activations = True
+
+    def disable_storage(self):
+        """Turn off the storage of activations during the forward pass."""
+        self.storing_activations = False
+
+    def get_activations(self):
+        """Return the stored activations from the most recent forward pass."""
+        return self.sparse_activations
+
+    def get_sparse_loss(self):
+        """Return the stored sparse_loss from the most recent forward pass."""
+        return self.sparse_loss

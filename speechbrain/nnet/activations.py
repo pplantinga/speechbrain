@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from speechbrain.utils.logger import get_logger
 
 logger = get_logger(__name__)
+JUMP_RELU_BANDWIDTH = 0.001
 
 
 class Softmax(torch.nn.Module):
@@ -169,3 +170,138 @@ class Swish(torch.nn.Module):
             x = x * self.beta
 
         return self.silu(x)
+
+
+class JumpReLU(torch.nn.Module):
+    """Activation function that zeros all values less than a jump_value.
+
+    This is good for some security and SAE applications, as the module
+    only outputs more confident predictions, see https://arxiv.org/abs/2407.14435v1
+
+    This paper covers implementation details used here, such as the use of `relu()` and `exp()`
+
+    Arguments
+    ---------
+    input_size: int, optional
+        Number of neurons in the input, needed if using per-output jump parameters.
+    static_threshold: float between 0 and +inf (non-inclusive), optional
+        A fixed positive value for all positions, an alternative to per-output thresholds.
+    initial_value: float between 0 and +inf (non-inclusive), default 0.001
+        With `input_size`, the initial threshold value across inputs.
+    """
+
+    def __init__(
+        self, input_size=None, static_threshold=None, initial_value=0.001
+    ):
+        super().__init__()
+
+        if (input_size is None) is (static_threshold is None):
+            raise ValueError(
+                "JumpReLU requires exactly one of input_size or static_threshold"
+            )
+
+        # exp() is later used to prevent negative thresholds, so undo here with log()
+        # Accordingly, will cause an error if a nonpositive initial or jump value is passed
+        if input_size is not None:
+            log_initial_value = torch.tensor(initial_value).log()
+            initial_threshold = torch.full((input_size,), log_initial_value)
+            self.log_threshold = torch.nn.Parameter(initial_threshold)
+        else:
+            self.log_threshold = torch.tensor(static_threshold).log()
+
+    def forward(self, x, sparse_loss=False):
+        """Returns x with all values < threshold zeroed out.
+
+        Arguments
+        ---------
+        x: torch.Tensor
+            Tensor on which to apply JumpReLU activations.
+        sparse_loss: bool
+            Whether to additionally return a sparsity criterion (l0).
+
+        Returns
+        -------
+        x: torch.Tensor
+            input with JumpReLU activations applied.
+        l0_loss: torch.Tensor, optional
+            Returned if `sparse_loss` is `True`.
+        """
+        x = JumpFunction.apply(F.relu(x), self.log_threshold.exp())
+
+        if sparse_loss:
+            return x, StepFunction.apply(x, self.log_threshold.exp())
+
+        return x
+
+
+class JumpFunction(torch.autograd.Function):
+    """Companion to JumpReLU module with pseudo-differentiation code.
+
+    Uses the straight-through-estimator (STE) trick in a small neighborhood
+    of the threshold value, defined here as JUMP_RELU_BANDWIDTH.
+
+    See https://arxiv.org/abs/2407.14435v1 for implementation details.
+    """
+
+    @staticmethod
+    def forward(x, threshold):
+        return x * (x < threshold)
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        ctx.save_for_backward(*inputs)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+
+        # No STE for x, only standard ReLU-type gradient
+        x_grad = (x > threshold) * grad_output
+
+        # STE for threshold gradient, using a rectangle function
+        threshold_grad = (
+            -(threshold / JUMP_RELU_BANDWIDTH)
+            * rectangle((x - threshold) / JUMP_RELU_BANDWIDTH)
+            * grad_output
+        )
+        return x_grad, threshold_grad
+
+
+class StepFunction(torch.autograd.Function):
+    """Heaviside step function with custom backwards.
+
+    Not intended for ordinary activations, used for l0-norm computation.
+
+    Uses the straight-through-estimator (STE) trick in a small neighborhood
+    of the threshold value, defined here as JUMP_RELU_BANDWIDTH.
+
+    See https://arxiv.org/abs/2407.14435v1 for implementation details.
+    """
+
+    @staticmethod
+    def forward(x, threshold):
+        return (x < threshold).to(x)
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        ctx.save_for_backward(*inputs)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+
+        # No STE for x, gradient is 0 everywhere
+        x_grad = 0.0 * grad_output
+
+        # STE for threshold gradient, using a rectangle function
+        threshold_grad = (
+            -(1.0 / JUMP_RELU_BANDWIDTH)
+            * rectangle((x - threshold) / JUMP_RELU_BANDWIDTH)
+            * grad_output
+        )
+        return x_grad, threshold_grad
+
+
+def rectangle(x):
+    """Used to compute JumpReLU threshold gradient STE"""
+    return ((x > -0.5) & (x < 0.5)).astype(x.dtype)
