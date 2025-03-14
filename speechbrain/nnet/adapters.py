@@ -12,7 +12,8 @@ from fnmatch import fnmatch
 import torch
 import torch.nn as nn
 
-from speechbrain.nnet.activations import JumpReLU, Swish
+from speechbrain.nnet.activations import Swish
+from speechbrain.nnet.losses import mse_loss
 from speechbrain.utils import checkpoints
 
 MHA_WARNING = """
@@ -125,6 +126,9 @@ class AdaptedModel(nn.Module):
             elif any(fnmatch(name, layer) for layer in unfrozen_layers):
                 for param in module.parameters():
                     param.requires_grad = True
+
+        if len(self.replace_layers) == 0:
+            warnings.warn("No adaptable layers found")
 
         # Some cases require a delay in adapter insertion, e.g. using Pretrainer
         if not manual_adapter_insertion:
@@ -413,16 +417,29 @@ class LoRA(nn.Module):
 class SparseAutoEncoder(nn.Module):
     """Adds a sparse auto-encoder (SAE) layer after a pretrained module.
 
+    Majority of initialization code comes from a reference implementation.
+    Github repo: saprmarks/dictionary_learning
+    Relevant file: dictionary_learning/dictionary.py
+
     Arguments
     ---------
-    target_module: nn.Module
+    target_module: torch.nn.Module
         A pretrained module for inserting the SAE layer.
     dict_size: int
         The number of neurons in the SAE layer, usually larger than the module output.
-    activation: class, default speechbrain.nnet.activations.JumpReLU
-        The class to use for activation, usually a ReLU-family function that creates
-        sparse outputs by zeroing some outputs. The passed class definition will be
-        called to initialize the activation function using the size of the target.
+    activation_fn: torch.nn.Module, default torch.nn.ReLU
+        The class to use for activation, usually a ReLU-family function
+        that creates sparse outputs by zeroing some outputs.
+        Compatible with speechbrain.nnet.activations.JumpReLU().
+    fidelity_loss_fn: loss fn, default speechbrain.nnet.losses.mse_loss
+        A loss function that takes predicions, targets for autoencoder loss.
+    storing_activations: bool, default False
+        Whether to start storing activations and losses. Can be changed later with
+        `enable_storage()` and `disable_storage()`.
+    sparse_loss_fn: str, default "L1"
+        Options are "L1", "L0", but ensure activation supports the argument
+        "sparse_loss" if you would like to compute the "L0" loss.
+
 
     Example
     -------
@@ -438,50 +455,101 @@ class SparseAutoEncoder(nn.Module):
     True
     """
 
-    def __init__(self, target_module, dict_size, activation=JumpReLU):
+    def __init__(
+        self,
+        target_module,
+        dict_size,
+        activation_fn=torch.nn.ReLU(),
+        fidelity_loss_fn=mse_loss,
+        storing_activations=False,
+        sparse_loss_fn="L0",
+    ):
         super().__init__()
 
-        # Ensure module is frozen
+        self.fidelity_loss_fn = fidelity_loss_fn
+
+        # Ensure module is frozen and collect info
         self.pretrained_module = target_module
         for param in target_module.parameters():
             param.requires_grad = False
+        module_out_size = target_module.weight.data.shape[0]
+        device = target_module.weight.device
 
-        # Initialize the parameters and activations of SAE
-        # TODO: handle activations that don't take `input_size`
-        weight_output_size = target_module.weight.data.shape[0]
-        self.encoder = nn.Linear(weight_output_size, dict_size)
-        self.activation = activation(input_size=dict_size)
-        self.decoder = nn.Linear(dict_size, weight_output_size)
-
-        # Initialize the machinery for caching the sparse activations and loss
+        # Initialize the machinery for caching the activations and loss
+        self.fidelity_loss = None
         self.sparse_loss = None
         self.sparse_activations = None
-        self.storing_activations = False
+        self.storing_activations = storing_activations
+        self.activation_fn = activation_fn
+        self.sparse_loss_fn = sparse_loss_fn
+
+        # Initialize the parameters according to reference
+        self.dict_size = dict_size
+        self.W_enc = nn.Parameter(
+            torch.empty(module_out_size, dict_size, device=device)
+        )
+        self.b_enc = nn.Parameter(torch.zeros(dict_size, device=device))
+        self.W_dec = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(dict_size, module_out_size, device=device)
+            )
+        )
+        self.b_dec = nn.Parameter(torch.zeros(module_out_size, device=device))
+        self.W_dec.data = self.W_dec / self.W_dec.norm(dim=1, keepdim=True)
+        self.W_enc.data = self.W_dec.data.clone().T
 
     def forward(self, x):
-        """Full forward pass, encode then decode for training purposes."""
-        if self.training:
-            # Compute and store loss during training, assuming we'll need it
-            activations, sparse_loss = self.encode(x, sparse_loss=True)
-            self.sparse_loss = sparse_loss
-        else:
-            activations = self.encode(x, sparse_loss=False)
+        """Full forward pass, encode then decode for training."""
+        activations, sparse_loss = self.encode(x, sparse_loss=True)
+        predictions = self.decode(activations)
 
         if self.storing_activations:
-            self.sparse_activations = activations
+            self.sparse_activations = activations.detach()
+            self.sparse_loss = sparse_loss
+            targets = self.pretrained_module(x).detach()
+            self.fidelity_loss = self.fidelity_loss_fn(predictions, targets)
 
-        return self.decode(activations)
+        return predictions
 
     def encode(self, x, sparse_loss=False):
-        """Returns the sparse activations for interpretability analysis."""
-        encoder_output = self.encoder(self.pretrained_module(x))
+        """Returns the sparse dictionary activations used for interpretability.
 
-        # TODO: Handle activations that don't return a sparse loss
-        return self.activation(encoder_output, sparse_loss=sparse_loss)
+        Basically uses either the loss defined by the activation module
+        (i.e. L0 loss when used with JumpReLU loss function) or the sparse loss in:
+        https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+
+        Arguments
+        ---------
+        x: torch.Tensor
+            Input tensor to the adapter model.
+        sparse_loss: bool
+            Whether to additionally return the sparse loss. In the case of
+            JumpReLU this is L0 defined in the module itself, otherwise
+            returns L1 loss.
+
+        Returns
+        -------
+        activations: torch.Tensor
+            The dictionary activations.
+        sparse_loss: torch.Tensor (conditional)
+            The sparsity loss defined by activation or L1.
+        """
+        encoder_output = self.pretrained_module(x) @ self.W_enc + self.b_enc
+
+        # If the L0 loss is not supported by the activation_fn, this will fail
+        if sparse_loss and self.sparse_loss_fn == "L0":
+            return self.activation_fn(encoder_output, sparse_loss=sparse_loss)
+        else:
+            output = self.activation_fn(encoder_output)
+            if sparse_loss:
+                sparse_loss_term = output.abs().mean(dim=0)
+                sparse_loss_term *= self.W_dec.norm(dim=1)
+                output = (output, sparse_loss_term.mean())
+            return output
 
     def decode(self, encoding):
         """Returns the decoded activations for use by the next layer."""
-        return self.decoder(encoding)
+        return encoding @ self.W_dec + self.b_dec
 
     def enable_storage(self):
         """Turn on the storage of activations during the forward pass."""
@@ -496,5 +564,9 @@ class SparseAutoEncoder(nn.Module):
         return self.sparse_activations
 
     def get_sparse_loss(self):
-        """Return the stored sparse_loss from the most recent forward pass."""
+        """Return the stored sparse loss from the most recent forward pass."""
         return self.sparse_loss
+
+    def get_fidelity_loss(self):
+        """Return the stored fidelity loss from the most recent forward pass."""
+        return self.fidelity_loss
