@@ -414,6 +414,38 @@ class LoRA(nn.Module):
         return x_pretrained + x_lora
 
 
+class MaskTemp:
+    """Keeps track of temperature for masking
+
+    Arguments
+    ---------
+    steps: int
+        Number of steps to reduce temperature over
+    start_temp: float
+        Starting temperature, usually > 1.0
+    stop_temp: float
+        Final temperature, usually between 0. and 1.
+    """
+
+    def __init__(self, steps, start_temp=2.0, stop_temp=0.1):
+        assert start_temp > stop_temp
+        assert steps > 0
+        self.steps = steps
+        self.stop_temp = stop_temp
+        self.temperature = start_temp
+        self.temperature_step_size = (start_temp - stop_temp) / steps
+
+    def update_temp(self):
+        """Update temperature one step while ensuring we don't go below stop_temp"""
+        if self.temperature > self.stop_temp:
+            self.temperature = max(
+                self.temperature - self.temperature_step_size, self.stop_temp
+            )
+
+    def __call__(self):
+        return self.temperature
+
+
 class SparseAutoEncoder(nn.Module):
     """Adds a sparse auto-encoder (SAE) layer after a pretrained module.
 
@@ -431,6 +463,7 @@ class SparseAutoEncoder(nn.Module):
         The class to use for activation, usually a ReLU-family function
         that creates sparse outputs by zeroing some outputs.
         Compatible with speechbrain.nnet.activations.JumpReLU().
+        Also accepts "mask" which adds mask estimation parameters and loss.
     fidelity_loss_fn: loss fn, default speechbrain.nnet.losses.mse_loss
         A loss function that takes predicions, targets for autoencoder loss.
     storing_activations: bool, default False
@@ -439,6 +472,9 @@ class SparseAutoEncoder(nn.Module):
     sparse_loss_fn: str, default "L1"
         Options are "L1", "L0", but ensure activation supports the argument
         "sparse_loss" if you would like to compute the "L0" loss.
+    mask_temperature: MaskTemp
+        The starting, stopping, and number of decay steps for the temperature
+        used in the sigmoid for each mask item.
 
 
     Example
@@ -463,6 +499,7 @@ class SparseAutoEncoder(nn.Module):
         fidelity_loss_fn=mse_loss,
         storing_activations=False,
         sparse_loss_fn="L0",
+        mask_temperature=MaskTemp(start_temp=2.0, stop_temp=0.1, steps=1000),
     ):
         super().__init__()
 
@@ -482,6 +519,7 @@ class SparseAutoEncoder(nn.Module):
         self.storing_activations = storing_activations
         self.activation_fn = activation_fn
         self.sparse_loss_fn = sparse_loss_fn
+        self.mask_temperature = mask_temperature
 
         # Initialize the parameters according to reference
         self.dict_size = dict_size
@@ -489,6 +527,15 @@ class SparseAutoEncoder(nn.Module):
             torch.empty(module_out_size, dict_size, device=device)
         )
         self.b_enc = nn.Parameter(torch.zeros(dict_size, device=device))
+
+        if self.activation_fn == "mask":
+            self.W_mask = nn.Parameter(
+                torch.nn.init.kaiming_uniform_(
+                    torch.empty(module_out_size, dict_size, device=device)
+                )
+            )
+            self.b_mask = nn.Parameter(torch.zeros(dict_size, device=device))
+
         self.W_dec = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(dict_size, module_out_size, device=device)
@@ -500,14 +547,22 @@ class SparseAutoEncoder(nn.Module):
 
     def forward(self, x):
         """Full forward pass, encode then decode for training."""
-        activations, sparse_loss = self.encode(x, sparse_loss=True)
-        predictions = self.decode(activations)
 
-        if self.storing_activations:
-            self.sparse_activations = activations.detach()
-            self.sparse_loss = sparse_loss
-            targets = self.pretrained_module(x).detach()
-            self.fidelity_loss = self.fidelity_loss_fn(predictions, targets)
+        if self.training:
+            activations, sparse_loss = self.encode(x, sparse_loss=True)
+            predictions = self.decode(activations)
+
+            if self.storing_activations:
+                self.sparse_activations = activations
+                self.sparse_loss = sparse_loss
+                targets = self.pretrained_module(x).detach()
+                self.fidelity_loss = self.fidelity_loss_fn(predictions, targets)
+        else:
+            activations = self.encode(x, sparse_loss=False)
+            predictions = self.decode(activations)
+
+            if self.storing_activations:
+                self.sparse_activations = activations
 
         return predictions
 
@@ -534,22 +589,41 @@ class SparseAutoEncoder(nn.Module):
         sparse_loss: torch.Tensor (conditional)
             The sparsity loss defined by activation or L1.
         """
-        encoder_output = self.pretrained_module(x) @ self.W_enc + self.b_enc
+        inputs = self.pretrained_module(x)
+        pre_activations = inputs @ self.W_enc + self.b_enc
 
-        # If the L0 loss is not supported by the activation_fn, this will fail
-        if sparse_loss and self.sparse_loss_fn == "L0":
-            return self.activation_fn(encoder_output, sparse_loss=sparse_loss)
-        else:
-            output = self.activation_fn(encoder_output)
+        if self.activation_fn == "mask":
+            pre_activations = pre_activations
+            if self.training:
+                t = 1 / self.mask_temperature()
+                mask = (t * (inputs @ self.W_mask + self.b_mask)).sigmoid()
+                # self.diversity_loss = mask.mean(dim=0) * mask.mean(dim=0).log()
+                self.diversity_loss = torch.relu(mask.mean(dim=0) - 0.5)
+            else:
+                mask = (inputs @ self.W_mask + self.b_mask) > 0
+            activations = mask.float() * pre_activations
             if sparse_loss:
-                sparse_loss_term = output.abs().mean(dim=0)
+                loss = (mask.mean(dim=0) * self.W_dec.norm(dim=1)).mean()
+                return activations, loss
+            return activations
+        # If the L0 loss is not supported by the activation_fn, this will fail
+        elif sparse_loss and self.sparse_loss_fn == "L0":
+            return self.activation_fn(pre_activations, sparse_loss=sparse_loss)
+        else:
+            activations = self.activation_fn(pre_activations)
+            if sparse_loss:
+                sparse_loss_term = activations.abs().mean(dim=0)
                 sparse_loss_term *= self.W_dec.norm(dim=1)
-                output = (output, sparse_loss_term.mean())
-            return output
+                return activations, sparse_loss_term.mean()
+            return activations
 
     def decode(self, encoding):
         """Returns the decoded activations for use by the next layer."""
         return encoding @ self.W_dec + self.b_dec
+
+    def update_temperature(self):
+        """Forward mask temp update to correct class."""
+        self.mask_temperature.update_temp()
 
     def enable_storage(self):
         """Turn on the storage of activations during the forward pass."""
@@ -559,7 +633,7 @@ class SparseAutoEncoder(nn.Module):
         """Turn off the storage of activations during the forward pass."""
         self.storing_activations = False
 
-    def get_activations(self):
+    def get_activations(self, pre_activations=False):
         """Return the stored activations from the most recent forward pass."""
         return self.sparse_activations
 
