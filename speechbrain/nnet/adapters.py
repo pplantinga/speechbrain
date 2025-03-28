@@ -459,6 +459,10 @@ class SparseAutoEncoder(nn.Module):
         A pretrained module for inserting the SAE layer.
     dict_size: int
         The number of neurons in the SAE layer, usually larger than the module output.
+    module_out_size: int, optional
+        This class can automatically determine the size of the module output only
+        in the case where it is a simple linear layer, otherwise, this must be
+        specified as an argument to the class.
     activation_fn: torch.nn.Module, default torch.nn.ReLU
         The class to use for activation, usually a ReLU-family function
         that creates sparse outputs by zeroing some outputs.
@@ -495,6 +499,7 @@ class SparseAutoEncoder(nn.Module):
         self,
         target_module,
         dict_size,
+        module_out_size=None,
         activation_fn=torch.nn.ReLU(),
         fidelity_loss_fn=mse_loss,
         storing_activations=False,
@@ -509,8 +514,9 @@ class SparseAutoEncoder(nn.Module):
         self.pretrained_module = target_module
         for param in target_module.parameters():
             param.requires_grad = False
-        module_out_size = target_module.weight.data.shape[0]
-        device = target_module.weight.device
+            device = param.device
+        if module_out_size is None:
+            module_out_size = target_module.weight.data.shape[0]
 
         # Initialize the machinery for caching the activations and loss
         self.fidelity_loss = None
@@ -589,6 +595,11 @@ class SparseAutoEncoder(nn.Module):
         sparse_loss: torch.Tensor (conditional)
             The sparsity loss defined by activation or L1.
         """
+        if hasattr(self.pretrained_module, "attn_pooling_w"):
+            out = self.pretrained_module.attn_pooling_w(x).squeeze(-1).float()
+            out = torch.nn.functional.softmax(out, dim=-1).unsqueeze(-1)
+            self.attention_scores = out
+
         inputs = self.pretrained_module(x)
         pre_activations = inputs @ self.W_enc + self.b_enc
 
