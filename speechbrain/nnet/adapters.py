@@ -602,9 +602,9 @@ class SparseAutoEncoder(nn.Module):
 
         inputs = self.pretrained_module(x)
         pre_activations = inputs @ self.W_enc + self.b_enc
+        self.pre_activations = pre_activations
 
         if self.activation_fn == "mask":
-            pre_activations = pre_activations
             if self.training:
                 t = 1 / self.mask_temperature()
                 mask = (t * (inputs @ self.W_mask + self.b_mask)).sigmoid()
